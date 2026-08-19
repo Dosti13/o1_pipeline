@@ -1,0 +1,171 @@
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Cache
+# =========================
+.cache/
+cache/
+cache_lulu_master
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+.tmp/
+.temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# =========================
+# Logs
+# =========================
+logs/
+log/
+*.log
+
+# =========================
+# Data
+# =========================
+data/
+datasets/
+dataset/
+raw_data/
+processed_data/
+output/
+outputs/
+results/
+
+# CSV / Excel / Parquet
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+
+# If you want to commit specific CSV files:
+# !important.csv
+
+# =========================
+# Models / ML
+# =========================
+models/
+model/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.bin
+
+# =========================
+# Scraping
+# =========================
+downloads/
+download/
+screenshots/
+*.html
+*.json
+
+# =========================
+# OS files
+# =========================
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.directory
+
+# =========================
+# IDE / Editors
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# Build / Distribution
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# Node.js (if used)
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =========================
+# Docker
+# =========================
+docker-data/
+docker-volumes/
+
+# =========================
+# Terraform
+# =========================
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# =========================
+# Misc
+# =========================
+coverage/
+htmlcov/
+.coverage
+coverage.xml
+
+*.pid
+*.lock
+*.sqlite
+*.db

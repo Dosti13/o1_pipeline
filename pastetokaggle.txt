@@ -1,0 +1,1242 @@
+"""
+Universal Product Categorizer — v4  (Barcode-first direct match, then Embedding+LLM cascade)
+=================================================================================================
+★★★ DUAL-GPU PATCH ★★★  (carried over from v3)
+  Original bug: OLLAMA_URL / OLLAMA_EMBED_URL were hardcoded to port 11434 (GPU 0 only).
+  Two Ollama servers were started (11434 + 11435) but every single embedding / LLM / verifier
+  call always went to 11434 — GPU 1 sat idle the whole run (0% util, 0 MiB used).
+
+  Fix applied here:
+    1. A round-robin host picker (`next_ollama_host()`) hands out 127.0.0.1:11434 / :11435
+       alternately (thread-safe) to every outgoing request — embedding, LLM adjudication,
+       AND verifier calls all rotate across whatever GPUs are actually running.
+    2. Works with 1 GPU or 2 GPUs automatically — with 1 GPU the cycle just returns the same
+       host every time (no behavior change, no risk).
+    3. LLM_BATCH_WORKERS / VERIFIER_BATCH_WORKERS / EMBED_MAX_WORKERS are now scaled by the
+       *actually detected* GPU count (2x per extra GPU) so the round-robin has enough
+       concurrent batches in flight to actually keep both GPUs busy.
+    4. Server startup now logs stdout/stderr to files (instead of discarding them) and prints
+       the tail of the relevant log if a server fails to come up in time — makes future
+       startup failures debuggable instead of a bare "did not start in time".
+
+★★★ REFERENCE-CORPUS SOURCE FILTER ★★★  (carried over from v3)
+  Previously ref_df (the reference/training corpus used for kNN + LLM candidates) was built
+  from EVERY row in the workbook that simply had a non-blank lulu_category — regardless of
+  which customer that row came from.
+  Fix: ref_df now ALSO requires source_customer to be "LULU" or "GRANDMALL" (case/whitespace
+  insensitive). Rows from any other source_customer are excluded from the reference corpus,
+  even if they happen to have a lulu_category filled in. Everything downstream (barcode index,
+  embeddings, kNN, LLM candidates) is unchanged in logic — it just now runs over this
+  narrower, cleaner reference set. The sheet used is unchanged (LULU_SHEET = "data").
+
+★★★ THINKING-MODE FIX (this edit) ★★★
+  Symptom: Stage 3 (and eventually Stage 4) logged repeated
+      raw content (first 600 chars): ''
+  on BOTH GPU hosts, surviving retries, for a subset of batches.
+
+  Root cause: qwen3:14b and gpt-oss:20b are both "thinking" models. Ollama auto-enables
+  thinking whenever a chat request omits the top-level `think` field — neither call_ollama()
+  nor call_verifier() ever set it. A thinking model's reasoning trace is returned in a
+  SEPARATE message["thinking"] field; message["content"] only gets the JSON answer AFTER the
+  model finishes reasoning. OLLAMA_NUM_PREDICT (700) caps thinking + answer tokens COMBINED.
+  On batches where the model reasoned longer (harder/more ambiguous items — the system prompt
+  explicitly invites this via the misleading-token warnings), it used the entire 700-token
+  budget still inside <think> and never emitted an answer -> content == "". This is a
+  token-budget effect, not a network/GPU problem, which is why it showed up on both hosts and
+  survived retries.
+
+  Fix:
+    1. qwen3 (Stage 3) — thinking has a real off-switch. We now pass "think": False at the
+       TOP LEVEL of the request payload (a sibling of "model"/"messages", NOT inside
+       "options" — a common mistake). No hidden reasoning tokens, full num_predict budget
+       goes to the actual JSON answer.
+    2. gpt-oss (Stage 4 verifier) — thinking CANNOT be disabled for this model; passing
+       True/False is silently ignored. Only "low" / "medium" / "high" is honored. We pass
+       "think": "low" to minimize (not eliminate) the trace, and size a SEPARATE, larger
+       num_predict budget (OLLAMA_NUM_PREDICT_VERIFIER) for verifier calls so the trace still
+       has room to finish before the answer.
+    3. Debug logging now also surfaces message["thinking"] (length + tail) whenever a batch's
+       parsed response length doesn't match the input, so any future truncation is obvious
+       at a glance instead of a bare empty string.
+  Nothing about the matching/categorization logic, prompts, or thresholds was changed.
+
+★★★ OLLAMA CRASH RECOVERY (this edit) ★★★
+  Symptom: partway through Stage 3, EVERY batch on a given host started failing with
+      Failed to establish a new connection: [Errno 111] Connection refused
+  on that host, for hundreds of consecutive batches, never recovering — forcing a manual
+  KeyboardInterrupt and a full notebook restart (twice, per the logs).
+
+  Root cause: "Connection refused" (vs. a timeout or a 5xx) means the `ollama serve` PROCESS
+  itself died on that GPU instance, not that a single request failed. Most likely trigger on a
+  16GB T4: OLLAMA_MAX_LOADED_MODELS=2 + OLLAMA_KEEP_ALIVE=60m meant the Stage-2 embedding model
+  (qwen3-embedding:4b, ~2.5GB) was still resident when Stage 3 loaded qwen3:14b (~9.3GB weights)
+  on the SAME GPU instance, on top of KV-cache for OLLAMA_NUM_PARALLEL=2 concurrent slots at
+  num_ctx=8192 — tight enough on 16GB to OOM-kill the ollama process under sustained load. Once
+  the process is dead, next_ollama_host() keeps round-robining requests to a corpse: every
+  attempt (and every retry) fails identically, forever, because nothing ever restarts it.
+
+  Fix (defense in depth — both layers matter):
+    1. PREVENT: OLLAMA_MAX_LOADED_MODELS dropped from "2" to "1" (CELL 0). This forces Ollama to
+       evict the previous stage's model before loading the next one on a given GPU instance, so
+       two large models are never resident on the same 16GB card at once. Costs a one-time
+       reload delay (~10-30s) at the start of each stage, which is negligible against total
+       runtime.
+    2. RECOVER: CELL 1's startup logic is refactored into a reusable `_start_ollama_instance()`
+       function (was inline, couldn't be called again). A new `ensure_host_alive()` (CELL 1B)
+       is called right before every embedding/LLM/verifier request; if the target host is down,
+       it relaunches `ollama serve` pinned to the correct GPU with the correct env vars and waits
+       for it to come back, instead of firing a doomed request. This is thread-safe with a
+       cooldown so concurrent workers hitting the same dead host don't each try to restart it.
+    3. Restart attempts are counted (`_host_restart_count`) and reported in the final Summary
+       sheet, so a run that self-healed is visible after the fact rather than looking identical
+       to one that never had a problem.
+  Nothing about the matching/categorization/thinking-mode logic was changed.
+
+★★★ THINK-LEAK FIX + SPEED (this edit) ★★★
+  Symptom: even with think=False set and confirmed in the Stage 3 header log line
+      Stage 3 — sending 9,280 row(s) to Ollama (qwen3:14b, think=False) …
+  a chunk of batches STILL came back with raw content == '' — and the whole stage's ETA was
+  ~28,300s (7.9 hours) for one file, way slower than a 14B model producing a few hundred tokens
+  of JSON per batch should take.
+
+  Root cause: Ollama's top-level "think": false is documented to work for the plain qwen3:8b
+  tag, but there is a long, still-active pattern of open ollama/ollama GitHub issues where it is
+  silently ignored for OTHER qwen3 tags/quantizations/versions (e.g. #12234 qwen3:4b, #12610
+  qwen3:30b, #12906/#13353/#14798 qwen3-vl variants) — the model keeps "thinking" regardless,
+  burning the entire num_predict budget on the hidden trace every time. This is NOT a transient
+  network glitch, so the existing retry loop calling the identical request 3x just reproduced
+  the identical empty result 3x — this alone explains most of the slowness (generating a full
+  reasoning trace up to the token budget is much slower than a short JSON answer, and doing it
+  3 times per affected batch multiplies that cost).
+
+  Fix:
+    1. Belt-and-suspenders suppression: qwen3's OWN chat template honors literal "/no_think" in
+       the prompt text, independent of Ollama's API-level "think" field — this is a SEPARATE
+       code path in Ollama's model renderer, so it can still work even when the API-level
+       wiring for a given tag is one of the buggy ones. Appended to the Stage-3 user message
+       whenever LLM_THINK is False.
+    2. OLLAMA_NUM_PREDICT raised 700 → 1200 as a safety margin in case suppression is still only
+       partial for a given call.
+    3. New `ThinkingLeakError` + thread-safe `_thinking_leak_total` counter: call_ollama() now
+       raises this distinct exception when the true leak signature shows up (content empty AND
+       thinking substantial AND nothing parseable to salvage) — a genuine partial answer is
+       still returned normally rather than treated as a leak, so the existing last-attempt
+       salvage behavior is untouched. `_process_llm_batch()` catches it specifically and gives
+       up after 2 hits instead of burning the full LLM_MAX_RETRIES budget on a failure retries
+       cannot fix. The total leak count is printed after Stage 3 and added to the Summary sheet,
+       so you can see directly whether this actually got the model to stop thinking (near 0 =
+       fixed) or whether qwen3:14b's specific build genuinely can't be suppressed this way (large
+       count persists = worth trying LLM_MODEL="qwen3:8b" instead, which is the tag most
+       consistently reported to honor think=False).
+  Nothing about the matching/categorization/crash-recovery logic was changed.
+=================================================================================================
+"""
+
+# ============================================================================
+# %% CELL 0 — CONFIG
+# ============================================================================
+import os
+
+LULU_XLSX               = "/kaggle/input/datasets/dostmuhammad23/catgory/categoriesandfinal_brand_standardized (1).xlsx"
+LULU_SHEET               = "data"
+
+NEW_FILE_TO_CATEGORIZE  = "/kaggle/input/datasets/dostmuhammad23/categor/dim_material_master.csv"
+NEW_FILE_SHEET           = 0     # ignored for csv
+
+_stem       = os.path.splitext(os.path.basename(NEW_FILE_TO_CATEGORIZE))[0]
+OUTPUT_XLSX = f"/kaggle/working/{_stem}_categorized.xlsx"
+
+# ── models (UNCHANGED) ───────────────────────────────────────────────────────
+EMBED_MODEL      = "qwen3-embedding:4b"
+LLM_MODEL        = "qwen3:14b"
+VERIFIER_MODEL         = "gpt-oss:20b"
+RUN_VERIFIER_STAGE     = True
+VERIFY_BORDERLINE_KNN  = True
+VERIFY_KNN_MARGIN      = 0.08
+
+# ── which source_customer values are allowed into the reference corpus ─────
+REF_ALLOWED_SOURCE_CUSTOMERS = ["LULU", "GRANDMALL"]
+
+# ── ★ THINKING-MODE FIX: per-model thinking controls ────────────────────────
+# qwen3 gets a real off-switch (no hidden reasoning tokens needed for this task —
+# the system prompt already encodes the judgment logic). gpt-oss can only be
+# tuned, never fully silenced, so we ask for the shortest trace ("low") and give
+# it a bigger, separate num_predict budget below to compensate.
+LLM_THINK               = False   # qwen3 (Stage 3) — disable thinking entirely
+VERIFIER_THINK_LEVEL    = "low"   # gpt-oss (Stage 4) — MUST be "low"/"medium"/"high"; bool is ignored
+
+# NOTE: these are now only used as the "shape" for building per-request URLs.
+# The actual host (11434 / 11435) is chosen per-request by next_ollama_host()
+# further down — see CELL 1B. Do not hardcode a single port anywhere else.
+OLLAMA_CHAT_PATH  = "/api/chat"
+OLLAMA_EMBED_PATH = "/api/embed"
+
+CACHE_DIR        = "/kaggle/working/cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(OUTPUT_XLSX), exist_ok=True)
+
+# ── Category acceptance thresholds (unchanged logic) ───────────────────────
+KNN_NEIGHBORS       = 5
+AUTO_ACCEPT_VOTES   = 4
+AUTO_ACCEPT_MIN_SIM = 0.55
+LLM_CANDIDATE_TOPN  = 4
+
+# ── Brand fuzzy-match gates ──────────────────────────────────────────────────
+BRAND_MIN_LEN_FOR_FUZZY = 4
+BRAND_FUZZY_CUTOFF      = 90
+
+# ── ★★★ THROUGHPUT / CONCURRENCY KNOBS ───────────────────────────────────────
+# These are BASE (per-GPU) values. They get multiplied by the detected GPU count
+# in CELL 1 (see "scaled for N GPU(s)" print) — do not rely on these raw numbers
+# after CELL 1 has run, use the scaled globals instead.
+LLM_BATCH_SIZE              = 6
+_LLM_BATCH_WORKERS_PER_GPU     = 2   # a single T4 running a 14b model chokes above ~2 concurrent
+_VERIFIER_BATCH_WORKERS_PER_GPU = 2  # same reasoning for the 20b verifier
+_EMBED_MAX_WORKERS_PER_GPU      = 6  # embed calls are cheap, safe to push higher
+LLM_MAX_RETRIES     = 3
+LLM_REQUEST_TIMEOUT = 600
+
+# ★ THINK-LEAK FIX: bumped 700 → 1200. Per-item answers stay well under 700 tokens for 6 items,
+#   but this is now a safety net: if think=False/no_think STILL gets ignored for this model
+#   tag on a given call, more headroom means a better chance the model reaches the actual
+#   answer instead of exhausting the budget purely on the hidden reasoning trace.
+OLLAMA_NUM_PREDICT           = 1200
+# ★ NEW: separate, larger budget for the gpt-oss verifier (Stage 4), since it always spends
+#   some tokens on its reasoning trace even at "low" and can't be forced to zero.
+OLLAMA_NUM_PREDICT_VERIFIER  = 1400
+OLLAMA_NUM_CTX      = 8192
+
+EMBED_BATCH_SIZE   = 64
+
+OLLAMA_NUM_PARALLEL      = "2"
+# ★ CRASH-RECOVERY FIX: was "2". Keeping 2 large models resident per GPU instance at once
+#   (e.g. the embedding model still loaded when qwen3:14b loads for Stage 3) is the likely
+#   cause of the Ollama server OOM-crashing mid-run on a 16GB T4. "1" forces eviction of the
+#   previous stage's model before the next one loads — small one-time reload cost, much safer.
+OLLAMA_MAX_LOADED_MODELS = "1"
+OLLAMA_KEEP_ALIVE        = "60m"
+
+HINT_COLUMNS = [
+     "division", "material_desc",
+     "mgrp_descr",
+     "prdh_descr_1",
+     "prdh_descr_2",
+     "prdh_descr_3",
+ "emgrp_desc", 
+    "barcode", "barcode_description",
+]
+HINT_TEXT_COLUMNS_FOR_EMBEDDING = [
+    "material_desc", "mgrp_descr", "prdh_descr_1", "prdh_descr_2", "prdh_descr_3",
+    "emgrp_desc", "barcode_description", "country",
+]
+BARCODE_COL = "barcode"
+NEW_FILE_NAME_COL = None
+
+
+# ============================================================================
+# %% CELL 1 — INSTALL + START ONE OLLAMA SERVER PER PHYSICAL GPU (auto-detected)
+# ============================================================================
+import subprocess, time, requests
+
+def _detect_gpu_count() -> int:
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+        n = len([l for l in out.stdout.splitlines() if l.strip().startswith("GPU ")])
+        return max(n, 1)
+    except Exception:
+        return 1
+
+_GPU_COUNT = _detect_gpu_count()
+
+subprocess.run("apt-get update -qq && apt-get install -y zstd pciutils -qq", shell=True, check=True)
+_GPU_COUNT = _detect_gpu_count()  # re-check now that nvidia-smi/pciutils are guaranteed present
+
+OLLAMA_PORTS = [11434, 11435][:max(_GPU_COUNT, 1)]
+OLLAMA_HOSTS = [f"http://127.0.0.1:{p}" for p in OLLAMA_PORTS]
+print(f"Detected {_GPU_COUNT} physical GPU(s) → starting {len(OLLAMA_HOSTS)} Ollama server instance(s): {OLLAMA_HOSTS}")
+if _GPU_COUNT < 2:
+    print("  ⚠ Only 1 GPU detected this session. Code will still run correctly (round-robin "
+          "just reuses the single host), but you won't get dual-GPU speedup. If you meant to "
+          "get 2 GPUs, check Kaggle Settings > Accelerator / your weekly GPU quota.")
+
+def _ollama_running(host: str) -> bool:
+    try:
+        return requests.get(f"{host}/api/version", timeout=2).ok
+    except Exception:
+        return False
+
+if not any(_ollama_running(h) for h in OLLAMA_HOSTS):
+    print("Installing Ollama …")
+    subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True)
+
+# ★ CRASH-RECOVERY FIX: host -> gpu_id / port lookups, and startup logic pulled out into a
+#   named function, so ensure_host_alive() (CELL 1B) can relaunch a dead instance later using
+#   the exact same pinning/env-var logic instead of duplicating it inline.
+GPU_ID_FOR_HOST = {host: gpu_id for gpu_id, host in enumerate(OLLAMA_HOSTS)}
+PORT_FOR_HOST   = {host: port for port, host in zip(OLLAMA_PORTS, OLLAMA_HOSTS)}
+_OLLAMA_LOG_FILES = {}  # gpu_id -> log path, used for diagnostics if startup fails
+
+def _start_ollama_instance(gpu_id: int, port: int, host: str, restart: bool = False) -> str:
+    """(Re)launch an `ollama serve` process pinned to one physical GPU. Returns its log path.
+    Used both by initial CELL 1 startup and by ensure_host_alive() (CELL 1B) after a crash."""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"]     = str(gpu_id)          # pin this instance to ONE physical GPU
+    env["OLLAMA_HOST"]              = f"127.0.0.1:{port}"
+    env["OLLAMA_NUM_PARALLEL"]      = OLLAMA_NUM_PARALLEL
+    env["OLLAMA_MAX_LOADED_MODELS"] = OLLAMA_MAX_LOADED_MODELS
+    env["OLLAMA_KEEP_ALIVE"]        = OLLAMA_KEEP_ALIVE
+    log_path = f"/kaggle/working/ollama_gpu{gpu_id}.log"
+    _OLLAMA_LOG_FILES[gpu_id] = log_path
+    verb = "Restarting" if restart else "Starting"
+    print(f"{verb} Ollama server on {host} pinned to GPU {gpu_id} "
+          f"(NUM_PARALLEL={OLLAMA_NUM_PARALLEL}, MAX_LOADED_MODELS={OLLAMA_MAX_LOADED_MODELS}) "
+          f"→ log: {log_path}")
+    log_f = open(log_path, "a" if restart else "w")  # append on restart so crash history stays visible
+    subprocess.Popen(["ollama", "serve"], stdout=log_f, stderr=subprocess.STDOUT, env=env)
+    return log_path
+
+def _wait_for_ollama(host: str, timeout_s: int = 60, poll_s: int = 2) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        if _ollama_running(host):
+            return True
+        time.sleep(poll_s)
+    return False
+
+for gpu_id, (port, host) in enumerate(zip(OLLAMA_PORTS, OLLAMA_HOSTS)):
+    if _ollama_running(host):
+        print(f"  Ollama already running on {host} (GPU {gpu_id}) — skipping start")
+        continue
+    _start_ollama_instance(gpu_id, port, host)
+
+for gpu_id, host in enumerate(OLLAMA_HOSTS):
+    if not _wait_for_ollama(host, timeout_s=60):
+        tail = ""
+        log_path = _OLLAMA_LOG_FILES.get(gpu_id)
+        if log_path and os.path.exists(log_path):
+            with open(log_path) as f:
+                tail = f.read()[-2000:]
+        raise RuntimeError(f"Ollama server on {host} did not start in time.\n--- log tail ({log_path}) ---\n{tail}")
+print("✓ All Ollama server instance(s) are up")
+
+for host in OLLAMA_HOSTS:
+    try:
+        r = requests.get(f"{host}/api/ps", timeout=5)
+        print(f"  {host} /api/ps:", r.json())
+    except Exception as e:
+        print(f"  Could not query {host}/api/ps:", e)
+
+print("Run `!nvidia-smi` in a separate cell now — GPU usage should appear only "
+      "once Stage 2/3 actually run (idle 0% before that is normal).")
+
+_models_to_pull = [EMBED_MODEL, LLM_MODEL]
+if RUN_VERIFIER_STAGE and VERIFIER_MODEL not in _models_to_pull:
+    _models_to_pull.append(VERIFIER_MODEL)
+
+pull_env = os.environ.copy()
+pull_env["OLLAMA_HOST"] = f"127.0.0.1:{OLLAMA_PORTS[0]}"  # model storage shared across instances — pull once
+for _m in _models_to_pull:
+    print(f"Pulling model: {_m} (skips if already local) …")
+    subprocess.run(["ollama", "pull", _m], check=True, env=pull_env)
+print("✓ Ollama ready with all models")
+
+
+# ============================================================================
+# %% CELL 1B — ★ ROUND-ROBIN HOST PICKER + GPU-SCALED CONCURRENCY ★
+# ============================================================================
+# This is the actual dual-GPU fix. Every outgoing embedding / LLM / verifier
+# request calls next_ollama_host() to get a host, instead of using one
+# hardcoded URL. With 2 GPUs running, consecutive requests alternate
+# 11434 -> 11435 -> 11434 -> ... so both GPUs get simultaneous work whether
+# you're in the embedding stage, the LLM stage, or the verifier stage.
+import itertools, threading
+
+_host_cycle = itertools.cycle(OLLAMA_HOSTS)
+_host_lock  = threading.Lock()
+
+def next_ollama_host() -> str:
+    with _host_lock:
+        return next(_host_cycle)
+
+# ★ CRASH-RECOVERY FIX: called right before every embedding/LLM/verifier request. If the
+# target Ollama instance has died (e.g. OOM-killed under load — see module docstring),
+# relaunch it pinned to the correct GPU and wait for it to come back, instead of firing a
+# request at a dead process. Thread-safe with a per-host cooldown so multiple worker threads
+# that discover the same dead host at once don't each try to restart it in parallel.
+_restart_lock          = threading.Lock()
+_last_restart_attempt  = {}   # host -> unix time of last restart attempt
+_host_restart_count     = 0    # total successful restarts this run, reported in the Summary sheet
+
+def ensure_host_alive(host: str, restart_timeout_s: int = 90, cooldown_s: int = 20) -> bool:
+    global _host_restart_count
+    if _ollama_running(host):
+        return True
+    with _restart_lock:
+        if _ollama_running(host):          # re-check inside the lock — another thread may have just fixed it
+            return True
+        now = time.time()
+        last = _last_restart_attempt.get(host, 0)
+        if now - last < cooldown_s:
+            # A restart was just attempted (by this thread or another) — don't pile on.
+            # Release the lock implicitly by falling through to the sleep below isn't needed;
+            # just wait out the remaining cooldown and re-check.
+            wait_s = cooldown_s - (now - last)
+        else:
+            wait_s = 0
+        _last_restart_attempt[host] = now
+        gpu_id = GPU_ID_FOR_HOST[host]
+        port   = PORT_FOR_HOST[host]
+        print(f"  ⚠ {host} (GPU {gpu_id}) is not responding — attempting to restart Ollama …")
+        if wait_s > 0:
+            time.sleep(wait_s)
+            if _ollama_running(host):
+                return True
+        log_path = _start_ollama_instance(gpu_id, port, host, restart=True)
+        ok = _wait_for_ollama(host, timeout_s=restart_timeout_s)
+        if ok:
+            _host_restart_count += 1
+            print(f"  ✓ {host} (GPU {gpu_id}) restarted successfully "
+                  f"(restart #{_host_restart_count} this run)")
+        else:
+            tail = ""
+            if os.path.exists(log_path):
+                with open(log_path) as f:
+                    tail = f.read()[-1500:]
+            print(f"  ✗ {host} (GPU {gpu_id}) failed to come back within {restart_timeout_s}s. "
+                  f"Log tail:\n{tail}")
+        return ok
+
+# Scale concurrency to however many GPUs we actually got. With 1 GPU this is
+# identical to the original tuned values (2 / 2 / 6). With 2 GPUs it doubles,
+# so there are enough batches in flight for the round-robin to actually keep
+# both GPUs busy instead of just alternating idle time.
+LLM_BATCH_WORKERS       = _LLM_BATCH_WORKERS_PER_GPU * _GPU_COUNT
+VERIFIER_BATCH_WORKERS  = _VERIFIER_BATCH_WORKERS_PER_GPU * _GPU_COUNT
+EMBED_MAX_WORKERS       = _EMBED_MAX_WORKERS_PER_GPU * _GPU_COUNT
+print(f"  Concurrency scaled for {_GPU_COUNT} GPU(s): "
+      f"LLM_BATCH_WORKERS={LLM_BATCH_WORKERS}, "
+      f"VERIFIER_BATCH_WORKERS={VERIFIER_BATCH_WORKERS}, "
+      f"EMBED_MAX_WORKERS={EMBED_MAX_WORKERS}")
+print(f"  Thinking mode: qwen3 think={LLM_THINK} | gpt-oss think_level={VERIFIER_THINK_LEVEL!r} "
+      f"(gpt-oss cannot fully disable thinking)")
+
+
+# ============================================================================
+# %% CELL 2 — LOAD DATA
+# ============================================================================
+import re, json, hashlib
+import numpy as np
+import pandas as pd
+from collections import Counter
+from pathlib import Path
+import concurrent.futures
+from rapidfuzz import fuzz, process
+from sklearn.neighbors import NearestNeighbors
+
+print("Loading combined workbook …")
+kb = pd.read_excel(LULU_XLSX, sheet_name=LULU_SHEET)
+kb["material_name"] = kb["material_name"].astype(str)
+
+# ★ CHANGED: the reference corpus (ref_df) is the "data" sheet, and it must now ALSO be
+# restricted to rows whose source_customer is LULU or GRANDMALL — any other source_customer
+# is excluded even if lulu_category happens to be filled in for that row. This is what we
+# match new items against (kNN + LLM candidates), so it must only contain rows we trust.
+if "source_customer" not in kb.columns:
+    raise KeyError(
+        "'source_customer' column not found in the reference workbook — cannot filter to "
+        f"{REF_ALLOWED_SOURCE_CUSTOMERS}. Available columns: {list(kb.columns)}"
+    )
+
+_source_customer_norm = kb["source_customer"].astype(str).str.strip().str.upper()
+_allowed_norm = {s.upper() for s in REF_ALLOWED_SOURCE_CUSTOMERS}
+
+ref_df = kb[
+    kb["lulu_category"].notna()
+    & (kb["lulu_category"].astype(str).str.strip() != "")
+    & _source_customer_norm.isin(_allowed_norm)
+].copy()
+ref_df = ref_df.dropna(subset=["material_name"]).reset_index(drop=True)
+
+print(f"  source_customer value counts (whole 'data' sheet):")
+print(kb["source_customer"].astype(str).str.strip().str.upper().value_counts().to_string())
+print(f"  Reference rows kept (source_customer in {REF_ALLOWED_SOURCE_CUSTOMERS} AND "
+      f"lulu_category filled): {len(ref_df):,}  (out of {len(kb):,} total rows in the sheet)")
+
+VALID_CATEGORIES = sorted(ref_df["lulu_category"].dropna().unique().tolist())
+print(f"  Valid categories: {len(VALID_CATEGORIES)}")
+
+brand_series = kb["brand"].dropna().astype(str).str.strip().str.upper()
+brand_series = brand_series[brand_series.str.len() > 0]
+ALL_BRANDS       = sorted(brand_series.unique().tolist())
+FUZZY_BRAND_POOL = [b for b in ALL_BRANDS if len(b) >= BRAND_MIN_LEN_FOR_FUZZY]
+BRAND_SET        = set(ALL_BRANDS)
+print(f"  Known brands: {len(ALL_BRANDS):,}  (fuzzy pool: {len(FUZZY_BRAND_POOL):,})")
+
+print(f"\nLoading new file to categorize: {NEW_FILE_TO_CATEGORIZE}")
+if str(NEW_FILE_TO_CATEGORIZE).lower().endswith((".xlsx", ".xls")):
+    new_df = pd.read_excel(NEW_FILE_TO_CATEGORIZE, sheet_name=NEW_FILE_SHEET)
+else:
+    new_df = pd.read_csv(NEW_FILE_TO_CATEGORIZE)
+
+print(f"  Columns found in new file: {list(new_df.columns)}")
+ORIGINAL_COLUMNS = list(new_df.columns)
+
+_NAME_CANDIDATES = ["material_name", "material_desc", "description", "product_name",
+                     "item_name", "item_description", "desc", "name"]
+
+if NEW_FILE_NAME_COL and NEW_FILE_NAME_COL in new_df.columns:
+    _resolved_name_col = NEW_FILE_NAME_COL
+elif NEW_FILE_NAME_COL:
+    raise KeyError(
+        f"NEW_FILE_NAME_COL was set to '{NEW_FILE_NAME_COL}' but that column isn't in the "
+        f"new file. Available columns: {list(new_df.columns)}"
+    )
+else:
+    _resolved_name_col = next((c for c in _NAME_CANDIDATES if c in new_df.columns), None)
+    if _resolved_name_col is None:
+        raise KeyError(
+            "Couldn't find a product-name column in the new file automatically. "
+            f"Available columns: {list(new_df.columns)}\n"
+            "Set NEW_FILE_NAME_COL in CELL 0 to the correct column name and rerun."
+        )
+
+print(f"  Using '{_resolved_name_col}' as the product-name column for this file")
+
+if _resolved_name_col != "material_name":
+    new_df["material_name"] = new_df[_resolved_name_col]
+
+n_before = len(new_df)
+new_df = new_df.dropna(subset=["material_name"]).reset_index(drop=True)
+print(f"  Rows: {n_before:,} -> {len(new_df):,} after dropping blank-name row(s)")
+
+
+# ============================================================================
+# %% CELL 3 — BARCODE-FIRST DIRECT MATCH  (unchanged, still no embedding/LLM cost)
+# ============================================================================
+
+def normalize_barcode(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, float):
+        val = f"{val:.0f}"
+    s = str(val).strip()
+    if s == "" or s.lower() in ("nan", "none", "0", "0.0"):
+        return None
+    if "e" in s.lower():
+        try:
+            s = f"{float(s):.0f}"
+        except ValueError:
+            pass
+    if s.endswith(".0"):
+        s = s[:-2]
+    s = re.sub(r"\D", "", s)
+    if not s or set(s) == {"0"} or len(s) < 6:
+        return None
+    return s
+
+barcode_to_ref = {}
+if BARCODE_COL in ref_df.columns:
+    is_lulu_row = (
+        ref_df["source_customer"].astype(str).str.upper().eq("LULU")
+        if "source_customer" in ref_df.columns else pd.Series([False] * len(ref_df))
+    )
+    order = ref_df.assign(_is_lulu=is_lulu_row).sort_values("_is_lulu", ascending=False)
+    for _, r in order.iterrows():
+        bc = normalize_barcode(r[BARCODE_COL])
+        if not bc or bc in barcode_to_ref:
+            continue
+        barcode_to_ref[bc] = {
+            "lulu_category": r["lulu_category"],
+            "brand": r.get("brand"),
+        }
+    print(f"  Barcode index built from reference corpus: {len(barcode_to_ref):,} unique barcodes")
+else:
+    print(f"  WARNING: '{BARCODE_COL}' not found in reference corpus — barcode-first match disabled")
+
+if BARCODE_COL in new_df.columns:
+    new_df["_barcode_norm"] = new_df[BARCODE_COL].apply(normalize_barcode)
+else:
+    new_df["_barcode_norm"] = None
+
+new_df["matched_via_barcode"] = new_df["_barcode_norm"].apply(lambda b: bool(b and b in barcode_to_ref))
+
+barcode_matched_mask = new_df["matched_via_barcode"]
+n_bc = int(barcode_matched_mask.sum())
+print(f"  ★ Direct barcode matches: {n_bc:,} / {len(new_df):,} rows — these SKIP embedding + LLM entirely")
+
+needs_categorization_mask = ~barcode_matched_mask
+
+
+# ============================================================================
+# %% CELL 4 — HINT-COLUMN TEXT BUILDERS  (unchanged)
+# ============================================================================
+
+def _clean_val(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() in ("nan", "none", "") else s
+
+def build_hint_text_for_embedding(row: pd.Series) -> str:
+    parts = []
+    for col in HINT_TEXT_COLUMNS_FOR_EMBEDDING:
+        if col in row.index:
+            v = _clean_val(row[col])
+            if v:
+                parts.append(v)
+    return " | ".join(parts)
+
+def build_hint_block_for_llm(row: pd.Series) -> dict:
+    block = {}
+    for col in HINT_COLUMNS:
+        if col in row.index:
+            v = _clean_val(row[col])
+            if v:
+                block[col] = v
+    return block
+
+new_df["_embed_text"] = (
+    new_df["material_name"].astype(str) + " | " + new_df.apply(build_hint_text_for_embedding, axis=1)
+).str.strip(" |")
+
+if any(c in ref_df.columns for c in HINT_TEXT_COLUMNS_FOR_EMBEDDING):
+    ref_df["_embed_text"] = (
+        ref_df["material_name"].astype(str) + " | " + ref_df.apply(build_hint_text_for_embedding, axis=1)
+    ).str.strip(" |")
+else:
+    ref_df["_embed_text"] = ref_df["material_name"].astype(str)
+
+
+# ============================================================================
+# %% CELL 5 — STAGE 1: RULE-BASED BRAND EXTRACTION  (unchanged, CPU-only, already fast)
+# ============================================================================
+
+def guess_brand_rule(name: str):
+    toks = re.findall(r"[A-Z0-9']+", str(name).upper())
+    for n in (3, 2, 1):
+        if len(toks) >= n:
+            cand = " ".join(toks[:n])
+            if cand in BRAND_SET:
+                return cand, "rule_exact", 100.0
+    cand = " ".join(toks[:2]) if len(toks) >= 2 else (toks[0] if toks else "")
+    if len(cand) < 5:
+        return None, "rule_none", 0.0
+    match = process.extractOne(cand, FUZZY_BRAND_POOL, scorer=fuzz.token_sort_ratio,
+                                score_cutoff=BRAND_FUZZY_CUTOFF)
+    if match:
+        return match[0], "rule_fuzzy", float(match[1])
+    return None, "rule_none", 0.0
+
+new_df["brand_final"]  = new_df.get("brand")
+new_df["brand_method"] = np.where(new_df.get("brand", pd.Series([None]*len(new_df))).notna()
+                                   & (new_df.get("brand", pd.Series([""]*len(new_df))).astype(str).str.strip() != ""),
+                                   "given", "")
+
+rule_targets = needs_categorization_mask & (
+    new_df["brand_final"].isna() | (new_df["brand_final"].astype(str).str.strip() == "")
+)
+print(f"Stage 1 — rule-based brand extraction on {int(rule_targets.sum()):,} non-barcode row(s) …")
+guesses = new_df.loc[rule_targets, "material_name"].apply(guess_brand_rule)
+new_df.loc[rule_targets, "brand_final"]  = [g[0] for g in guesses]
+new_df.loc[rule_targets, "brand_method"] = [g[1] for g in guesses]
+print(new_df.loc[needs_categorization_mask, "brand_method"].value_counts().to_string())
+
+
+# ============================================================================
+# %% CELL 6 — EMBEDDING HELPERS — ★ round-robin across GPUs ★  (unchanged)
+# ============================================================================
+
+def _hash_list(items) -> str:
+    h = hashlib.sha256()
+    for it in items:
+        h.update(str(it).encode("utf-8", errors="ignore")); h.update(b"\x00")
+    return h.hexdigest()[:20]
+
+def _ollama_embed_chunk(chunk: list, model: str) -> list:
+    payload = {"model": model, "input": chunk}
+    last_err = None
+    for attempt in range(3):
+        host = next_ollama_host()            # ★ round-robin: alternates GPU 0 / GPU 1
+        if not ensure_host_alive(host):      # ★ CRASH-RECOVERY FIX
+            last_err = f"{host}: down and could not be restarted"; time.sleep(1 * (attempt + 1)); continue
+        embed_url = f"{host}{OLLAMA_EMBED_PATH}"
+        try:
+            resp = requests.post(embed_url, json=payload, timeout=120)
+            resp.raise_for_status()
+            embs = resp.json().get("embeddings")
+            if not embs or len(embs) != len(chunk):
+                raise ValueError("unexpected /api/embed response shape")
+            return embs
+        except Exception as e:
+            last_err = f"{host}: {e}"; time.sleep(1 * (attempt + 1))
+    raise RuntimeError(f"Ollama embedding failed: {last_err}")
+
+def ollama_embed_texts(texts: list, model: str, batch_size: int = EMBED_BATCH_SIZE,
+                        max_workers: int = None, label: str = "") -> np.ndarray:
+    if max_workers is None:
+        max_workers = EMBED_MAX_WORKERS   # ★ resolved at call time, already GPU-scaled
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+    n_chunks = (len(texts) + batch_size - 1) // batch_size
+    chunks = [texts[i*batch_size:(i+1)*batch_size] for i in range(n_chunks)]
+    results = [None] * n_chunks
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_ollama_embed_chunk, c, model): i for i, c in enumerate(chunks)}
+        done = 0
+        for fut in concurrent.futures.as_completed(futs):
+            results[futs[fut]] = fut.result()
+            done += 1
+            elapsed = time.time() - t0
+            eta = (elapsed / done) * (n_chunks - done)
+            if done % 5 == 0 or done == n_chunks:
+                print(f"  [{label}] embedding chunk {done}/{n_chunks}  "
+                      f"({elapsed:.1f}s elapsed, ~{eta:.1f}s left)")
+    flat = [v for chunk in results for v in chunk]
+    arr = np.array(flat, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True); norms[norms == 0] = 1.0
+    return arr / norms
+
+def get_cached_embeddings(texts: list, model: str, label: str) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+    key = _hash_list(texts) + "_" + model.replace(":", "_").replace("/", "_")
+    path = os.path.join(CACHE_DIR, f"emb_{label}_{key}.npy")
+    if os.path.exists(path):
+        try:
+            arr = np.load(path)
+            if arr.shape[0] == len(texts):
+                print(f"  ✓ [{label}] embedding cache hit → {path}")
+                return arr
+        except Exception:
+            pass
+    print(f"  Encoding {len(texts):,} texts via Ollama (model={model}) …")
+    arr = ollama_embed_texts(texts, model=model, label=label)
+    try:
+        np.save(path, arr)
+    except Exception as e:
+        print(f"  ⚠ could not cache embeddings: {e}")
+    return arr
+
+
+# ============================================================================
+# %% CELL 7 — STAGE 2: EMBEDDING kNN  +  STAGE 3: LLM ADJUDICATION (★ round-robin + thinking fix)
+# ============================================================================
+
+work_df = new_df.loc[needs_categorization_mask].copy()
+print(f"Stage 2 — embedding kNN for {len(work_df):,} row(s) without a barcode match …")
+
+ref_emb  = get_cached_embeddings(ref_df["_embed_text"].tolist(), EMBED_MODEL, "reference")
+work_emb = get_cached_embeddings(work_df["_embed_text"].tolist(), EMBED_MODEL, "newfile_nobarcode")
+
+cand_categories, cand_examples, auto_category, auto_confidence = [], [], [], []
+
+if len(work_df) and ref_emb.shape[0]:
+    nn = NearestNeighbors(n_neighbors=min(KNN_NEIGHBORS, len(ref_df)), metric="cosine").fit(ref_emb)
+    dist, idx = nn.kneighbors(work_emb)
+    sims = 1 - dist
+    ref_cats  = ref_df["lulu_category"].tolist()
+    ref_names = ref_df["material_name"].tolist()
+
+    for i in range(len(work_df)):
+        row_cats = [ref_cats[j] for j in idx[i]]
+        row_sims = sims[i]
+        c = Counter(row_cats)
+        top_cat, votes = c.most_common(1)[0]
+        avg_sim = float(np.mean([s for s, cat in zip(row_sims, row_cats) if cat == top_cat]))
+
+        seen, cands, ex = set(), [], {}
+        order = sorted(range(len(row_cats)), key=lambda k: -row_sims[k])
+        for k in order:
+            cat = row_cats[k]
+            if cat in seen:
+                continue
+            seen.add(cat); cands.append(cat); ex[cat] = ref_names[idx[i][k]]
+            if len(cands) >= LLM_CANDIDATE_TOPN:
+                break
+        cand_categories.append(cands)
+        cand_examples.append(ex)
+
+        if votes >= AUTO_ACCEPT_VOTES and avg_sim >= AUTO_ACCEPT_MIN_SIM:
+            auto_category.append(top_cat); auto_confidence.append(round(avg_sim, 3))
+        else:
+            auto_category.append(None); auto_confidence.append(round(avg_sim, 3))
+
+work_df["_cand_categories"] = cand_categories
+work_df["_cand_examples"]   = cand_examples
+work_df["category_auto"]    = auto_category
+work_df["category_conf"]    = auto_confidence
+
+n_auto = work_df["category_auto"].notna().sum() if len(work_df) else 0
+print(f"  Auto-accepted category (embedding kNN, no LLM): {n_auto:,} / {len(work_df):,} "
+      f"({(n_auto/len(work_df)*100) if len(work_df) else 0:.1f}%)")
+
+# ── STAGE 3: LLM (prompt unchanged) ─────────────────────────────────────────
+SYSTEM_PROMPT = (
+    "You are a product taxonomist for a Qatar FMCG hypermarket (LULU). Map a retail "
+    "product to the single best category from the provided candidate list belonging "
+    "to the LULU master taxonomy. Judge by the product's true semantic meaning, not "
+    "by matching words literally. Beware misleading tokens: 'Rice Flour' is a FLOUR "
+    "not a RICE; 'Chicken Masala' is a spice mix, not fresh chicken; 'Diet Coke' is a "
+    "soft drink, not a diet/health product. Use any hint fields provided (material "
+    "description, merchandise group, product hierarchy descriptions, country of "
+    "origin, barcode description) as supporting context, and treat the customer's own "
+    "category as only a WEAK hint — it may be wrong or inconsistent with LULU's "
+    "taxonomy. You MUST choose exactly one category from the candidate list given for "
+    "each item; if truly none fit, and only then, answer \"UNKNOWN\". Also propose a "
+    "brand guess only where asked (need_brand=true) and only if a real brand name is "
+    "identifiable from the text — never invent one.\n\n"
+    "Respond with ONLY a single JSON OBJECT (no prose, no markdown fences) in this "
+    "exact shape:\n"
+    '{"items": [{"category": "<exact candidate or UNKNOWN>", "brand": "...", '
+    '"confidence": 0.0, "reason": "<=12 words"}, ...]}\n'
+    "The \"items\" array must contain exactly one object per input item, in the SAME "
+    "ORDER as given."
+)
+
+def build_batch_payload(rows: pd.DataFrame):
+    items = []
+    for _, r in rows.iterrows():
+        need_brand = str(r.get("brand_final", "")).strip() in ("", "nan", "None")
+        cands = r["_cand_categories"]
+        ex    = r["_cand_examples"]
+        items.append({
+            "name": r["material_name"],
+            "customer_category_hint": _clean_val(r.get("customer_category")) or None,
+            "hints": build_hint_block_for_llm(r),
+            "candidates": [{"category": c, "example": ex[c]} for c in cands],
+            "need_brand": bool(need_brand),
+        })
+    return items
+
+# ★ THINK-LEAK FIX (this edit): Ollama's top-level "think" field is documented to work for the
+# plain qwen3:8b tag but is inconsistently honored for OTHER qwen3 tags/quantizations across
+# Ollama versions — this is a real, still-open pattern across many ollama/ollama GitHub issues
+# (#12234, #12610, #12906, #13353, #14798, and others): "think": false is silently ignored and
+# the model burns its ENTIRE num_predict budget on the hidden <think> trace, producing
+# message["content"] == "" every single time for that prompt — NOT a transient glitch, so
+# retrying the identical request 3x just wastes 3x the time for the same empty result. This
+# class + counter let call_ollama() signal that specific failure mode distinctly so
+# _process_llm_batch() can stop retrying early instead of burning the full retry budget.
+class ThinkingLeakError(RuntimeError):
+    """Raised when a thinking-capable model ignored think=False/no_think and produced an empty
+    answer because the entire token budget went to the hidden reasoning trace instead."""
+    pass
+
+_thinking_leak_lock  = threading.Lock()
+_thinking_leak_total = 0
+
+def _record_thinking_leak():
+    global _thinking_leak_total
+    with _thinking_leak_lock:
+        _thinking_leak_total += 1
+
+def call_ollama(items: list, debug_label: str = ""):
+    host = next_ollama_host()            # ★ round-robin: alternates GPU 0 / GPU 1
+    if not ensure_host_alive(host):      # ★ CRASH-RECOVERY FIX: restart it here rather than
+        raise RuntimeError(f"Ollama host {host} is down and could not be restarted")  # firing a doomed request
+    chat_url = f"{host}{OLLAMA_CHAT_PATH}"
+    user_msg = "Classify these products:\n" + json.dumps({"items": items}, ensure_ascii=False)
+    if not LLM_THINK:
+        # ★ THINK-LEAK FIX: belt-and-suspenders. Qwen3's OWN chat template honors "/no_think"
+        # in the prompt text independently of Ollama's API-level "think" field, so send both —
+        # if Ollama's wiring for this particular tag/quant is one of the buggy ones, the
+        # template-level instruction is a separate code path that can still catch it.
+        user_msg += "\n\n/no_think"
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "format": "json",
+        # ★ THINKING-MODE FIX: top-level field, NOT inside "options". qwen3 defaults to
+        #   thinking=on when this is omitted, which was silently burning the whole
+        #   num_predict budget on hidden reasoning tokens (message["thinking"]) before the
+        #   model ever got to the JSON answer on harder batches -> empty content.
+        "think": LLM_THINK,
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": OLLAMA_NUM_PREDICT, "num_ctx": OLLAMA_NUM_CTX},
+    }
+    resp = requests.post(chat_url, json=payload, timeout=LLM_REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    message = resp.json()["message"]
+    content = message.get("content", "")  # .get(), not [..] — content can legitimately be absent/empty
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        matches = re.findall(r"\{[^{}]*\}", content)
+        parsed = []
+        for m in matches:
+            try:
+                obj = json.loads(m)
+                if "category" in obj or "brand" in obj:
+                    parsed.append(obj)
+            except json.JSONDecodeError:
+                break
+    if isinstance(parsed, dict):
+        if "items" in parsed and isinstance(parsed["items"], list):
+            parsed = parsed["items"]
+        else:
+            for v in parsed.values():
+                if isinstance(v, list):
+                    parsed = v; break
+            else:
+                parsed = [parsed] if parsed else []
+    if not isinstance(parsed, list):
+        raise ValueError("Model did not return a JSON array")
+    if len(parsed) != len(items):
+        print(f"  [debug {debug_label} host={host}] raw content (first 600 chars): {content[:600]!r}")
+        thinking = message.get("thinking") or ""
+        if thinking:
+            # ★ THINK-LEAK FIX: this is the tell. If content is empty/short but thinking is
+            #   long, the model spent its whole num_predict budget reasoning and never got to
+            #   answer. Only escalate to ThinkingLeakError when parsed is EMPTY (nothing to
+            #   salvage) — if the model returned SOME items despite the mismatch, keep the old
+            #   behavior of returning that partial list so the existing last-attempt salvage
+            #   logic in _process_llm_batch still gets a chance to use it.
+            print(f"  [debug {debug_label} host={host}] thinking field had {len(thinking)} chars "
+                  f"(num_predict={OLLAMA_NUM_PREDICT}, think={LLM_THINK}) — model may have run out "
+                  f"of budget before answering. Tail: {thinking[-300:]!r}")
+            if not parsed and len(thinking) > 200:
+                _record_thinking_leak()
+                raise ThinkingLeakError(
+                    f"host={host} debug_label={debug_label}: {len(thinking)} chars of thinking, "
+                    f"0 answer items — think=False/no_think did not suppress reasoning for this "
+                    f"model tag (known Ollama issue for some qwen3 variants)")
+    return parsed
+
+def _process_llm_batch(batch_rows_idx, batch_df):
+    """Runs one Stage-3 batch end to end (with retries). Safe to call from multiple threads."""
+    items = build_batch_payload(batch_df)
+    result = None
+    thinking_leak_hits = 0
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            candidate = call_ollama(items, debug_label=f"{batch_rows_idx[0]} attempt {attempt}")
+            if len(candidate) == len(items):
+                result = candidate; break
+            if attempt == LLM_MAX_RETRIES and candidate:
+                result = candidate
+        except ThinkingLeakError as e:
+            # ★ THINK-LEAK FIX: this is a deterministic template/model behavior, not a network
+            # blip — identical retries almost always reproduce the identical empty result. Give
+            # it one extra try in case temperature=0.1 randomness saves it, but don't burn the
+            # full LLM_MAX_RETRIES budget chasing a failure mode retries can't fix.
+            thinking_leak_hits += 1
+            print(f"  ⚠ batch starting {batch_rows_idx[0]} attempt {attempt}: {e}")
+            if thinking_leak_hits >= 2:
+                print(f"  ✗ batch starting {batch_rows_idx[0]}: giving up early after "
+                      f"{thinking_leak_hits} thinking-leak hits (retrying further would just "
+                      f"repeat the same result) — marking UNKNOWN")
+                break
+        except Exception as e:
+            print(f"  ⚠ batch starting {batch_rows_idx[0]} attempt {attempt} failed: {e}")
+        if attempt < LLM_MAX_RETRIES:
+            time.sleep(2)
+
+    out = {}
+    if not result:
+        for ridx in batch_rows_idx:
+            out[ridx] = {"category": "UNKNOWN", "confidence": 0.0, "reason": "no LLM response"}
+        return out
+
+    if len(result) < len(batch_rows_idx):
+        result = result + [{}] * (len(batch_rows_idx) - len(result))
+    for ridx, o in zip(batch_rows_idx, result):
+        out[ridx] = o
+    return out
+
+needs_llm_mask_local = work_df["category_auto"].isna() if len(work_df) else pd.Series([], dtype=bool)
+llm_idx = work_df.index[needs_llm_mask_local].tolist() if len(work_df) else []
+print(f"Stage 3 — sending {len(llm_idx):,} row(s) to Ollama ({LLM_MODEL}, think={LLM_THINK}) — "
+      f"batch_size={LLM_BATCH_SIZE}, {LLM_BATCH_WORKERS} batches in parallel, "
+      f"round-robin across {len(OLLAMA_HOSTS)} GPU host(s) …")
+
+llm_category, llm_brand, llm_confidence, llm_reason = {}, {}, {}, {}
+
+batches = []
+for batch_start in range(0, len(llm_idx), LLM_BATCH_SIZE):
+    batch_rows_idx = llm_idx[batch_start: batch_start + LLM_BATCH_SIZE]
+    batches.append((batch_rows_idx, work_df.loc[batch_rows_idx]))
+
+t0 = time.time()
+done_batches = 0
+with concurrent.futures.ThreadPoolExecutor(max_workers=LLM_BATCH_WORKERS) as ex:
+    futs = {ex.submit(_process_llm_batch, b_idx, b_df): b_idx for b_idx, b_df in batches}
+    for fut in concurrent.futures.as_completed(futs):
+        result_map = fut.result()
+        for ridx, out in result_map.items():
+            cat = str(out.get("category", "UNKNOWN")).strip() or "UNKNOWN"
+            if cat != "UNKNOWN" and cat not in VALID_CATEGORIES:
+                cat = "UNKNOWN"
+            llm_category[ridx]   = cat
+            llm_confidence[ridx] = out.get("confidence", 0.0)
+            llm_reason[ridx]     = str(out.get("reason", ""))[:120]
+            brand_guess = str(out.get("brand", "")).strip()
+            if brand_guess and brand_guess.lower() not in ("none", "nan", "unknown"):
+                llm_brand[ridx] = brand_guess.upper()
+        done_batches += 1
+        if done_batches % 10 == 0 or done_batches == len(batches):
+            elapsed = time.time() - t0
+            eta = (elapsed / done_batches) * (len(batches) - done_batches)
+            print(f"  … {done_batches}/{len(batches)} batches done "
+                  f"({elapsed:.0f}s elapsed, ~{eta:.0f}s left)")
+
+print("✓ Stage 3 complete")
+if _thinking_leak_total:
+    print(f"  ⚠ think=False/no_think was ignored by the model {_thinking_leak_total} time(s) "
+          f"this run (empty content, budget burned on hidden reasoning) — if this number is "
+          f"large relative to batch count, consider switching LLM_MODEL to a tag known to "
+          f"honor think=False more reliably (e.g. plain qwen3:8b) rather than fighting it.")
+
+work_df["lulu_category_final"] = work_df["category_auto"]
+work_df["category_method"]     = np.where(work_df["category_auto"].notna(), "embed_knn_auto", "")
+work_df["llm_reason"]          = ""
+
+for ridx, cat in llm_category.items():
+    work_df.at[ridx, "lulu_category_final"] = cat
+    work_df.at[ridx, "category_method"] = "llm"
+for ridx, conf in llm_confidence.items():
+    if work_df.at[ridx, "category_method"] == "llm":
+        work_df.at[ridx, "category_conf"] = conf
+for ridx, r in llm_reason.items():
+    work_df.at[ridx, "llm_reason"] = r
+for ridx, b in llm_brand.items():
+    cur = work_df.at[ridx, "brand_final"]
+    if pd.isna(cur) or str(cur).strip() == "":
+        work_df.at[ridx, "brand_final"]  = b
+        work_df.at[ridx, "brand_method"] = "llm"
+
+
+# ============================================================================
+# %% CELL 7B — STAGE 4: SECOND-OPINION VERIFIER LLM (★ round-robin + thinking fix)
+# ============================================================================
+
+VERIFIER_SYSTEM_PROMPT = (
+    "You are a strict QA reviewer for a product-categorization system. You will be "
+    "shown a product, the category it was assigned, and a reference example product "
+    "that already belongs to that category. Decide if the assignment is CORRECT, or "
+    "AMBIGUOUS/WRONG. Judge by true semantic meaning, not superficial word overlap — "
+    "the same misleading-token traps apply (e.g. a flavored spice mix named after an "
+    "ingredient is not that raw ingredient; a diet/zero soft drink is still a "
+    "beverage, not a health product). If the product could plausibly belong to more "
+    "than one very different category, or the assigned category is a poor semantic "
+    "fit, mark it ambiguous/wrong rather than rubber-stamping it.\n\n"
+    "Respond with ONLY a single JSON OBJECT (no prose, no markdown fences):\n"
+    '{"items": [{"verified": true/false, "ambiguous": true/false, '
+    '"confidence": 0.0, "note": "<=15 words"}, ...]}\n'
+    "One object per input item, SAME ORDER as given."
+)
+
+def build_verifier_payload(rows: pd.DataFrame):
+    items = []
+    for _, r in rows.iterrows():
+        assigned_cat = r["lulu_category_final"]
+        ex = r["_cand_examples"].get(assigned_cat) if isinstance(r.get("_cand_examples"), dict) else None
+        items.append({
+            "name": r["material_name"],
+            "assigned_category": assigned_cat,
+            "reference_example": ex,
+            "hints": build_hint_block_for_llm(r),
+        })
+    return items
+
+def call_verifier(items: list, debug_label: str = ""):
+    host = next_ollama_host()            # ★ round-robin: alternates GPU 0 / GPU 1
+    if not ensure_host_alive(host):      # ★ CRASH-RECOVERY FIX: restart it here rather than
+        raise RuntimeError(f"Ollama host {host} is down and could not be restarted")  # firing a doomed request
+    chat_url = f"{host}{OLLAMA_CHAT_PATH}"
+    user_msg = "Review these category assignments:\n" + json.dumps({"items": items}, ensure_ascii=False)
+    payload = {
+        "model": VERIFIER_MODEL,
+        "messages": [
+            {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "format": "json",
+        # ★ THINKING-MODE FIX: gpt-oss CANNOT disable thinking — passing True/False is
+        #   silently ignored for this model, only "low"/"medium"/"high" is honored. We ask
+        #   for the shortest trace and size num_predict (below) with extra headroom for it.
+        "think": VERIFIER_THINK_LEVEL,
+        "stream": False,
+        "options": {"temperature": 0.0, "num_predict": OLLAMA_NUM_PREDICT_VERIFIER, "num_ctx": OLLAMA_NUM_CTX},
+    }
+    resp = requests.post(chat_url, json=payload, timeout=LLM_REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    message = resp.json()["message"]
+    content = message.get("content", "")
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        matches = re.findall(r"\{[^{}]*\}", content)
+        parsed = []
+        for m in matches:
+            try:
+                obj = json.loads(m)
+                if "verified" in obj:
+                    parsed.append(obj)
+            except json.JSONDecodeError:
+                break
+    if isinstance(parsed, dict):
+        parsed = parsed.get("items", [parsed] if parsed else [])
+    if not isinstance(parsed, list):
+        raise ValueError("Verifier did not return a JSON array")
+    if len(parsed) != len(items):
+        print(f"  [verifier debug {debug_label} host={host}] raw (first 500 chars): {content[:500]!r}")
+        thinking = message.get("thinking") or ""
+        if thinking:
+            print(f"  [verifier debug {debug_label} host={host}] thinking field had {len(thinking)} "
+                  f"chars (num_predict={OLLAMA_NUM_PREDICT_VERIFIER}, think={VERIFIER_THINK_LEVEL!r}) "
+                  f"— gpt-oss may still be running long on its trace. Tail: {thinking[-300:]!r}")
+    return parsed
+
+def _process_verifier_batch(batch_rows_idx, batch_df):
+    items = build_verifier_payload(batch_df)
+    result = None
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            candidate = call_verifier(items, debug_label=f"{batch_rows_idx[0]} attempt {attempt}")
+            if len(candidate) == len(items):
+                result = candidate; break
+        except Exception as e:
+            print(f"  ⚠ verifier batch starting {batch_rows_idx[0]} attempt {attempt} failed: {e}")
+        time.sleep(2)
+
+    out = {}
+    if not result:
+        for ridx in batch_rows_idx:
+            out[ridx] = None  # signal: leave original verdict untouched
+        return out
+    if len(result) < len(batch_rows_idx):
+        result = result + [{}] * (len(batch_rows_idx) - len(result))
+    for ridx, o in zip(batch_rows_idx, result):
+        out[ridx] = o
+    return out
+
+work_df["verified"]        = None
+work_df["verifier_ambiguous"] = None
+work_df["verifier_note"]      = ""
+work_df["verifier_model"]     = ""
+
+if RUN_VERIFIER_STAGE and len(work_df):
+    verify_mask = (work_df["category_method"] == "llm") & (work_df["lulu_category_final"] != "UNKNOWN")
+    if VERIFY_BORDERLINE_KNN:
+        borderline = (work_df["category_method"] == "embed_knn_auto") & \
+                     (work_df["category_conf"] < AUTO_ACCEPT_MIN_SIM + VERIFY_KNN_MARGIN)
+        verify_mask = verify_mask | borderline
+
+    verify_idx = work_df.index[verify_mask].tolist()
+    print(f"Stage 4 — sending {len(verify_idx):,} assignment(s) to verifier "
+          f"({VERIFIER_MODEL}, think={VERIFIER_THINK_LEVEL!r}) — "
+          f"batch_size={LLM_BATCH_SIZE}, {VERIFIER_BATCH_WORKERS} batches in parallel, "
+          f"round-robin across {len(OLLAMA_HOSTS)} GPU host(s) …")
+
+    v_batches = []
+    for batch_start in range(0, len(verify_idx), LLM_BATCH_SIZE):
+        batch_rows_idx = verify_idx[batch_start: batch_start + LLM_BATCH_SIZE]
+        v_batches.append((batch_rows_idx, work_df.loc[batch_rows_idx]))
+
+    t0 = time.time()
+    done_batches = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=VERIFIER_BATCH_WORKERS) as ex:
+        futs = {ex.submit(_process_verifier_batch, b_idx, b_df): b_idx for b_idx, b_df in v_batches}
+        for fut in concurrent.futures.as_completed(futs):
+            result_map = fut.result()
+            for ridx, out in result_map.items():
+                if out is None:
+                    work_df.at[ridx, "verifier_note"] = "verifier unavailable — original verdict kept"
+                    continue
+                work_df.at[ridx, "verified"]          = bool(out.get("verified", False))
+                work_df.at[ridx, "verifier_ambiguous"] = bool(out.get("ambiguous", False))
+                work_df.at[ridx, "verifier_note"]      = str(out.get("note", ""))[:150]
+                work_df.at[ridx, "verifier_model"]      = VERIFIER_MODEL
+            done_batches += 1
+            if done_batches % 10 == 0 or done_batches == len(v_batches):
+                elapsed = time.time() - t0
+                eta = (elapsed / done_batches) * (len(v_batches) - done_batches)
+                print(f"  … {done_batches}/{len(v_batches)} verifier batches done "
+                      f"({elapsed:.0f}s elapsed, ~{eta:.0f}s left)")
+
+    n_disputed = int((work_df["verified"] == False).sum())
+    print(f"  Verifier result: {n_disputed:,} assignment(s) disputed / flagged ambiguous")
+else:
+    print("Stage 4 — verifier disabled (RUN_VERIFIER_STAGE=False)")
+
+
+# ============================================================================
+# %% CELL 8 — MERGE + WRITE OUTPUT  (unchanged logic; two new summary rows)
+# ============================================================================
+
+bc_df = new_df.loc[barcode_matched_mask].copy()
+if len(bc_df):
+    ref_lookup = bc_df["_barcode_norm"].map(barcode_to_ref)
+    bc_df["lulu_category_final"] = ref_lookup.apply(lambda d: d["lulu_category"] if d else "UNKNOWN")
+    bc_df["category_method"]     = "barcode"
+    bc_df["category_conf"]       = 1.0
+    bc_df["llm_reason"]          = "direct barcode match — skipped embedding/LLM"
+    bc_df["verified"]            = None
+    bc_df["verifier_ambiguous"]  = None
+    bc_df["verifier_note"]       = "n/a — barcode match, not sent to verifier"
+    bc_df["verifier_model"]      = ""
+    ref_brand = ref_lookup.apply(lambda d: d.get("brand") if d else None)
+    need_brand_mask = bc_df["brand_final"].isna() | (bc_df["brand_final"].astype(str).str.strip() == "")
+    bc_df.loc[need_brand_mask, "brand_final"]  = ref_brand[need_brand_mask]
+    bc_df.loc[need_brand_mask, "brand_method"] = "barcode"
+
+combined = pd.concat([bc_df, work_df], axis=0).sort_index()
+
+combined["needs_review"] = (
+    (combined["lulu_category_final"] == "UNKNOWN") |
+    (combined["lulu_category_final"].isna()) |
+    (combined["brand_final"].isna() | (combined["brand_final"].astype(str).str.strip() == "")) |
+    (combined["verified"] == False) |
+    (combined["verifier_ambiguous"] == True)
+)
+
+result_cols = ["lulu_category_final", "brand_final", "category_method", "category_conf",
+               "brand_method", "llm_reason", "matched_via_barcode",
+               "verified", "verifier_ambiguous", "verifier_note", "verifier_model",
+               "needs_review"]
+final_df = combined[ORIGINAL_COLUMNS + result_cols].rename(columns={
+    "lulu_category_final": "lulu_category",
+    "brand_final": "brand",
+    "category_conf": "similarity_confidence_score",
+})
+
+print(f"\nWriting → {OUTPUT_XLSX}")
+with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+    final_df.to_excel(writer, sheet_name="Categorized", index=False)
+    final_df[final_df["needs_review"]].to_excel(writer, sheet_name="Needs Review", index=False)
+
+    summary_rows = [
+        {"Metric": "Total rows",                          "Value": len(final_df)},
+        {"Metric": "Embedding model used",                "Value": EMBED_MODEL},
+        {"Metric": "LLM model used",                      "Value": LLM_MODEL},
+        {"Metric": "Reference corpus size (LULU+GRANDMALL only)", "Value": len(ref_df)},
+        {"Metric": "GPUs detected / used",                "Value": f"{_GPU_COUNT} ({', '.join(OLLAMA_HOSTS)})"},
+        {"Metric": "Ollama server restarts this run",      "Value": _host_restart_count},
+        {"Metric": "think=False/no_think ignored (thinking-leak count)", "Value": _thinking_leak_total},
+        {"Metric": "Matched directly via Barcode",        "Value": int((final_df['category_method']=='barcode').sum())},
+        {"Metric": "Category via embedding kNN (auto)",   "Value": int((final_df['category_method']=='embed_knn_auto').sum())},
+        {"Metric": "Category via LLM",                    "Value": int((final_df['category_method']=='llm').sum())},
+        {"Metric": "Category = UNKNOWN",                  "Value": int((final_df['lulu_category']=='UNKNOWN').sum())},
+        {"Metric": "LLM thinking mode (qwen3)",            "Value": f"disabled (think={LLM_THINK})"},
+        {"Metric": "Verifier model used",                 "Value": VERIFIER_MODEL if RUN_VERIFIER_STAGE else "disabled"},
+        {"Metric": "Verifier thinking level (gpt-oss)",     "Value": VERIFIER_THINK_LEVEL if RUN_VERIFIER_STAGE else "n/a"},
+        {"Metric": "Assignments sent to verifier",         "Value": int(final_df['verifier_model'].astype(str).ne("").sum())},
+        {"Metric": "Verifier: confirmed",                   "Value": int((final_df['verified']==True).sum())},
+        {"Metric": "Verifier: disputed/rejected",           "Value": int((final_df['verified']==False).sum())},
+        {"Metric": "Verifier: flagged ambiguous",           "Value": int((final_df['verifier_ambiguous']==True).sum())},
+        {"Metric": "Brand via Barcode",                    "Value": int((final_df['brand_method']=='barcode').sum())},
+        {"Metric": "Brand given already",                 "Value": int((final_df['brand_method']=='given').sum())},
+        {"Metric": "Brand via rule (exact)",               "Value": int((final_df['brand_method']=='rule_exact').sum())},
+        {"Metric": "Brand via rule (fuzzy)",               "Value": int((final_df['brand_method']=='rule_fuzzy').sum())},
+        {"Metric": "Brand via LLM",                        "Value": int((final_df['brand_method']=='llm').sum())},
+        {"Metric": "Brand still blank",                    "Value": int((final_df['brand'].isna() | (final_df['brand'].astype(str).str.strip()=='')).sum())},
+        {"Metric": "Rows flagged needs_review",            "Value": int(final_df['needs_review'].sum())},
+    ]
+    pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
+
+print("✓ Done")
+print(pd.DataFrame(summary_rows).to_string(index=False))
